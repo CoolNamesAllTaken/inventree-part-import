@@ -1,11 +1,12 @@
 from typing import Any
 
-from error_helper import error
 from oauthlib.oauth2 import BackendApplicationClient
+from requests import Response
 from requests.compat import quote
 from requests.exceptions import HTTPError, JSONDecodeError, Timeout
 from requests_oauthlib import OAuth2Session
 
+from ..exceptions import SupplierError
 from ..localization import get_country, get_language
 from ..retries import setup_session
 from .base import ApiPart, Supplier, SupplierSupportLevel
@@ -25,7 +26,18 @@ class DigiKey(Supplier):
         interactive_part_matches: int,
         **kwargs: Any,
     ):
-        self.limit = interactive_part_matches
+        # Despite its name this is the keyword search's result limit, sent to the API as
+        # `Limit`. A non-number here (False for "do not ask", say) used to go on the wire as
+        # is, DigiKey answered with a parse error, and the search quietly returned nothing.
+        try:
+            self.limit = int(interactive_part_matches)
+        except (TypeError, ValueError):
+            self.limit = 0
+        if self.limit < 1:
+            self.load_error(
+                f"invalid interactive_part_matches '{interactive_part_matches}' "
+                f"(the search result limit; must be a positive integer)"
+            )
 
         if not (country := get_country(location)):
             self.load_error(f"invalid country code '{location}'")
@@ -145,21 +157,39 @@ class DigiKeyApi:
         if result := self._api_call(url):
             return result.json()
 
-    def _api_call(self, url: str, json: dict[str, Any] | None = None):
-        result = None
+    def _api_call(self, url: str, json: dict[str, Any] | None = None) -> Response | None:
+        """
+        One request to the API, or a `SupplierError` saying why it failed.
+
+        Raising is deliberate: an API failure that is merely printed and then answered with
+        an empty result is indistinguishable from "no such part" to whatever called this,
+        and a misconfigured account would report nothing wrong forever.
+        """
+        result: Response | None = None
 
         try:
             result = self.session.get(url) if json is None else self.session.post(url, json=json)
             if result.status_code == 404 and result.json()["title"] == "Not Found":
                 return result
             result.raise_for_status()
-        except (HTTPError, Timeout):
-            assert result is not None
-            error(result.json()["detail"], prefix="DigiKey API error: ")
+        except (HTTPError, Timeout) as e:
+            raise SupplierError("DigiKey", _describe_failure(result, e)) from e
         except (JSONDecodeError, KeyError) as e:
-            error(str(e), prefix="DigiKey API error: ")
+            raise SupplierError("DigiKey", f"unexpected API response ({e})") from e
 
         return result
+
+
+def _describe_failure(result: Response | None, exception: Exception) -> str:
+    if result is not None:
+        try:
+            body: dict[str, Any] = result.json()
+            if detail := body.get("detail") or body.get("title"):
+                return f"{detail} (HTTP {result.status_code})"
+        except (JSONDecodeError, ValueError, AttributeError):
+            pass
+        return f"HTTP {result.status_code} ({exception})"
+    return str(exception)
 
 
 SUPPORTED_LANGUAGES = [

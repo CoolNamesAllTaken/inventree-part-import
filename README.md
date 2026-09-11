@@ -228,6 +228,45 @@ They'll get called in the order they're defined in.
 
 For more examples, checkout my [config repository](https://github.com/30350n/inventree_part_import_config).
 
+## Using It as a Library
+
+The supplier layer works without the CLI, its configuration files, or a terminal, so another
+program -- a web service, say -- can search distributors through it and do its own importing.
+Three things make that possible:
+
+- Importing the package has no side effects. The configuration directory is created on first
+  use, and `INVENTREE_PART_IMPORT_CONFIG_DIR` overrides where it goes.
+- `config.set_config(...)` supplies the `config.yaml` settings from code, and when neither it nor
+  the file exists, `get_config()` raises `ConfigurationError` instead of prompting whenever
+  stdin is not a terminal.
+- `suppliers.create_supplier(id, **parameters)` builds one supplier from explicit `setup()`
+  parameters. It never reads or writes `suppliers.yaml`, and a missing required parameter is a
+  `SupplierLoadError` naming it.
+
+```python
+from inventree_part_import.config import set_config
+from inventree_part_import.exceptions import SupplierError, SupplierLoadError
+from inventree_part_import.suppliers import create_supplier
+
+set_config({"currency": "USD", "language": "en", "location": "US", "scraping": False})
+
+try:
+    digikey = create_supplier("digikey", client_id="...", client_secret="...",
+                              interactive_part_matches=10)
+except SupplierLoadError as e:
+    ...  # bad credentials, unsupported locale, a parameter left out
+
+try:
+    parts, total = digikey.search("GRM0335C1E470JA01D")
+except SupplierError as e:
+    ...  # the API failed; this is not "no results"
+```
+
+`search()` returns `ApiPart` dataclasses. A supplier whose API fails raises `SupplierError`
+rather than printing and returning an empty list, so a broken account cannot be mistaken for a
+part nobody stocks. `cached_search()` remembers the last `Supplier.SEARCH_CACHE_SIZE` terms
+per supplier.
+
 ## Goal
 
 The end goal of this project is to not exist anymore in it's current form. Ideally everything

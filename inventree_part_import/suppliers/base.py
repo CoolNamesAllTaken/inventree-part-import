@@ -1,6 +1,7 @@
 import inspect
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import IntEnum
 from http.cookiejar import CookieJar
@@ -99,6 +100,11 @@ class SupplierSupportLevel(IntEnum):
 class Supplier:
     SUPPORT_LEVEL: SupplierSupportLevel
 
+    #: How many distinct search terms `cached_search()` remembers per supplier. A CLI run
+    #: never notices the bound; a long-lived process that searched without one would not
+    #: notice either, until it ran out of memory.
+    SEARCH_CACHE_SIZE = 256
+
     def setup(self, **kwargs: Any):
         pass
 
@@ -114,10 +120,13 @@ class Supplier:
 
     def cached_search(self, search_term: str) -> tuple[list[ApiPart], int]:
         if not hasattr(self, "_cache"):
-            self._cache: dict[str, tuple[list[ApiPart], int]] = {}
+            self._cache: OrderedDict[str, tuple[list[ApiPart], int]] = OrderedDict()
         elif result := self._cache.get(search_term):
+            self._cache.move_to_end(search_term)
             return result
         self._cache[search_term] = (result := self.search(search_term))
+        while len(self._cache) > self.SEARCH_CACHE_SIZE:
+            self._cache.popitem(last=False)
         return result
 
     @property

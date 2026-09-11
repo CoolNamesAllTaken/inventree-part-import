@@ -2,6 +2,10 @@ class InvenTreePartImportError(Exception):
     pass
 
 
+class ConfigurationError(InvenTreePartImportError):
+    """The configuration is missing or invalid and there is nobody to ask for it."""
+
+
 class InvenTreeObjectCreationError(InvenTreePartImportError):
     def __init__(self, object_type: type, message: str = "unknown error"):
         self.object_type = object_type

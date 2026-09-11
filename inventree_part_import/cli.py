@@ -24,7 +24,7 @@ from .config import (
     update_config_file,
     update_supplier_config,
 )
-from .exceptions import InvenTreeObjectCreationError
+from .exceptions import ConfigurationError, InvenTreeObjectCreationError, SupplierError
 from .inventree_helpers import get_category, get_category_parts
 from .part_importer import ImportResult, PartImporter
 from .suppliers import get_suppliers, setup_supplier_companies
@@ -53,6 +53,8 @@ def handle_errors(func: Callable[P, None]) -> Callable[P, None]:
             else:
                 raise e
         except InvenTreeObjectCreationError as e:
+            error(e, prefix="FATAL: ")
+        except (ConfigurationError, SupplierError) as e:
             error(e, prefix="FATAL: ")
 
     return wrapper

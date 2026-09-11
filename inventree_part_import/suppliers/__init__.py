@@ -2,13 +2,14 @@ import importlib
 from inspect import isclass
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from error_helper import error, hint
 from inventree.api import InvenTreeAPI
 from inventree.company import Company as InvenTreeCompany
 
 from ..config import SUPPLIERS_CONFIG, get_config, load_suppliers_config, update_config_file
+from ..exceptions import ConfigurationError, SupplierLoadError
 from ..inventree_helpers import Company
 from .base import ScrapeSupplier, Supplier
 
@@ -76,20 +77,18 @@ _supplier_objects: dict[str, Supplier] | None = None
 _available_supplier_objects: dict[str, Supplier] | None = None
 
 
-def get_suppliers(reload: bool = False, setup: bool = True):
-    global _supplier_objects, _available_supplier_objects
-    if not reload and _supplier_objects is not None and _available_supplier_objects is not None:
-        return _supplier_objects, _available_supplier_objects
+def discover_supplier_classes() -> dict[str, type[Supplier]]:
+    """
+    Every supplier module in this package, keyed by its id (`supplier_<id>.py`).
 
-    _supplier_objects = {}
-    _available_supplier_objects = {}
+    A module that fails to import or defines no single `Supplier` subclass is reported and
+    left out; one broken supplier must not remove the others.
+    """
+    classes: dict[str, type[Supplier]] = {}
     for path in Path(__file__).parent.glob("supplier_*.py"):
         module_name = path.stem
         try:
-            if module_name in locals():
-                module = importlib.reload(locals()[module_name])
-            else:
-                module = importlib.import_module(f".{module_name}", package=__package__)
+            module = importlib.import_module(f".{module_name}", package=__package__)
         except ImportError as e:
             error(f"failed to load supplier module '{module_name}' with {e}")
             continue
@@ -109,7 +108,74 @@ def get_suppliers(reload: bool = False, setup: bool = True):
             continue
 
         id = module_name.split("supplier_", 1)[-1]
-        _available_supplier_objects[id] = supplier_classes[0]()
+        classes[id] = supplier_classes[0]
+
+    return classes
+
+
+def available_supplier_ids() -> list[str]:
+    return sorted(discover_supplier_classes())
+
+
+def create_supplier(id: str, **parameters: Any) -> Supplier:
+    """
+    Build one configured supplier from explicit parameters.
+
+    For programs that embed this package: nothing here reads or writes `suppliers.yaml`, and
+    nothing prompts. `parameters` are the keyword arguments of the supplier's `setup()` --
+    `client_id`, `currency`, and so on -- and a required one that is missing is a
+    `SupplierLoadError` naming it, not a question on stdin. A parameter that is not given
+    falls back to the global configuration (see `config.set_config()`), which is what the
+    CLI's `suppliers.yaml` does too.
+
+    Search with `supplier.search(term)`; it raises `SupplierError` when the supplier's API
+    fails, which is not the same thing as finding nothing.
+    """
+    classes = discover_supplier_classes()
+    if not (cls := classes.get(id)):
+        raise SupplierLoadError(
+            id, f"unknown supplier id (available: {', '.join(sorted(classes)) or 'none'})"
+        )
+
+    supplier = cls()
+    try:
+        global_config: Mapping[str, Any] = get_config()
+    except ConfigurationError:
+        global_config = {}
+
+    setup_parameters: dict[str, Any] = {}
+    missing: list[str] = []
+    for name, default in supplier.get_setup_params().items():
+        if name in parameters:
+            setup_parameters[name] = parameters[name]
+        elif default is not None:
+            setup_parameters[name] = default
+        elif (value := global_config.get(name)) is not None:
+            setup_parameters[name] = value
+        else:
+            missing.append(name)
+    if missing:
+        raise SupplierLoadError(
+            supplier.name, f"missing setup parameter(s): {', '.join(missing)}"
+        )
+
+    extra = {name: value for name, value in parameters.items() if name not in setup_parameters}
+    try:
+        supplier.setup(**setup_parameters, **extra)
+    except TypeError as e:
+        raise SupplierLoadError(supplier.name, f"invalid setup parameters ({e})") from e
+    return supplier
+
+
+def get_suppliers(reload: bool = False, setup: bool = True):
+    global _supplier_objects, _available_supplier_objects
+    if not reload and _supplier_objects is not None and _available_supplier_objects is not None:
+        return _supplier_objects, _available_supplier_objects
+
+    _supplier_objects = {}
+    _available_supplier_objects = {
+        id: cls() for id, cls in discover_supplier_classes().items()
+    }
 
     _available_supplier_objects = dict(
         sorted(

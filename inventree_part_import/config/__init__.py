@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import shutil
 import sys
 from contextlib import contextmanager
 from inspect import isfunction
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Generator, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Callable, Generator, Literal, Mapping, cast, overload
 
 import yaml
 from cutie import prompt_yes_or_no, secure_input, select, select_multiple
@@ -21,16 +22,33 @@ if TYPE_CHECKING:
     from ..suppliers.base import ApiPart, Supplier
 
 from .. import __package__ as parent_package
-from ..exceptions import SupplierLoadError
+from ..exceptions import ConfigurationError, SupplierLoadError
 from ..localization import currencies, get_country, get_language
 from ..retries import RetryInvenTreeAPI
 
 PARENT_DIR = Path(__file__).parent
 
-_config_dir = None
+CONFIG_DIR_ENVIRONMENT_VARIABLE = "INVENTREE_PART_IMPORT_CONFIG_DIR"
+
+_config_dir: Path | None = None
 
 
-def get_config_dir():
+def get_config_dir() -> Path:
+    """
+    The configuration directory, created on first use.
+
+    Resolved in this order: an explicit `set_config_dir()`, then
+    `$INVENTREE_PART_IMPORT_CONFIG_DIR`, then the platform's per-user configuration directory.
+    Nothing touches the filesystem until something actually needs the directory, so importing
+    this package has no side effects -- which matters when it is embedded in another program.
+    """
+    global _config_dir
+    if _config_dir is None:
+        if environment_dir := os.environ.get(CONFIG_DIR_ENVIRONMENT_VARIABLE):
+            set_config_dir(Path(environment_dir))
+        else:
+            set_config_dir(user_config_path(parent_package))
+    assert _config_dir is not None
     return _config_dir
 
 
@@ -39,20 +57,15 @@ def set_config_dir(new_config_dir: Path):
     new_config_dir = Path(new_config_dir).resolve()
     new_config_dir.mkdir(parents=True, exist_ok=True)
     _config_dir = new_config_dir
-    _setup_gitignore()
+    _setup_gitignore(new_config_dir)
 
 
-def _setup_gitignore():
+def _setup_gitignore(config_dir: Path):
     # if someone decides to create a git repository in the CONFIG_DIR,
     # stop them from leaking their api keys
-    assert _config_dir is not None  # TODO
-    _gitignore = _config_dir / ".gitignore"
+    _gitignore = config_dir / ".gitignore"
     if not _gitignore.exists():
         _gitignore.write_text("inventree.yaml\nsuppliers.yaml\n", encoding="utf-8")
-
-
-# setup default config dir
-set_config_dir(user_config_path(parent_package))
 
 INVENTREE_CONFIG = "inventree.yaml"
 
@@ -60,8 +73,7 @@ INVENTREE_CONFIG = "inventree.yaml"
 def setup_inventree_api():
     api_timeout = get_config()["request_timeout"]
 
-    assert _config_dir is not None  # TODO
-    inventree_config = _config_dir / INVENTREE_CONFIG
+    inventree_config = get_config_dir() / INVENTREE_CONFIG
     info("setting up InvenTree API ...")
     if inventree_config.is_file():
         info(f"loading api configuration from '{INVENTREE_CONFIG}' ...")
@@ -140,8 +152,32 @@ RENAMED_CONFIG_VARS = {
     "max_results": "interactive_part_matches",
 }
 
-_config_loaded = None
+_config_loaded: dict[str, Any] | None = None
 CONFIG = "config.yaml"
+
+
+def set_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """
+    Use `config` as the configuration, in place of `config.yaml`.
+
+    For programs that embed this package and hold their settings elsewhere: nothing is read
+    from or written to the configuration directory, and `get_config()` never prompts. Keys are
+    the ones `config.yaml` accepts; an unknown one is a `ConfigurationError` rather than a
+    warning, because there is no human watching for one. Returns the effective configuration,
+    defaults filled in.
+    """
+    global _config_loaded
+    if unknown := set(config) - VALID_CONFIG_VARS:
+        raise ConfigurationError(
+            f"unknown configuration parameter(s): {', '.join(sorted(unknown))}"
+        )
+    _config_loaded = {**DEFAULT_CONFIG_VARS, **config}
+    return _config_loaded
+
+
+def _stdin_is_interactive() -> bool:
+    stdin = sys.stdin
+    return stdin is not None and stdin.isatty()
 
 
 @overload
@@ -153,22 +189,22 @@ def get_config(reload: bool = False):
     if not reload and _config_loaded is not None:
         return _config_loaded
 
-    assert _config_dir is not None  # TODO
-    config = _config_dir / CONFIG
+    config_dir = get_config_dir()
+    config = config_dir / CONFIG
     if config.is_file():
         try:
-            _config_loaded = yaml.safe_load(config.read_text(encoding="utf-8"))
-            for invalid_parameter in set(_config_loaded) - VALID_CONFIG_VARS:
+            loaded: dict[str, Any] = yaml.safe_load(config.read_text(encoding="utf-8"))
+            for invalid_parameter in set(loaded) - VALID_CONFIG_VARS:
                 if renamed_parameter := RENAMED_CONFIG_VARS.get(invalid_parameter):
                     warning(
                         f"deprecated parameter '{invalid_parameter}' in {CONFIG} "
                         f"(renamed to '{renamed_parameter}')"
                     )
-                    _config_loaded[renamed_parameter] = _config_loaded.pop(invalid_parameter)
+                    loaded[renamed_parameter] = loaded.pop(invalid_parameter)
                 else:
                     warning(f"invalid parameter '{invalid_parameter}' in '{CONFIG}'")
-                    del _config_loaded[invalid_parameter]
-            _config_loaded = {**DEFAULT_CONFIG_VARS, **_config_loaded}
+                    del loaded[invalid_parameter]
+            _config_loaded = {**DEFAULT_CONFIG_VARS, **loaded}
             return _config_loaded
         except MarkedYAMLError as e:
             error(e, prefix="")
@@ -177,6 +213,14 @@ def get_config(reload: bool = False):
     if reload:
         _config_loaded = None
         return _config_loaded
+
+    if not _stdin_is_interactive():
+        # Asking would only ever produce "EOF when reading a line" from a service or a pipe,
+        # and a caller that got that far deserves to be told what it is missing instead.
+        raise ConfigurationError(
+            f"no '{CONFIG}' in '{config_dir}' and no terminal to ask for one; create the file, "
+            f"or call inventree_part_import.config.set_config(...) before using the package"
+        )
 
     info(f"failed to find {CONFIG} config file", end="\n")
     new_configuration_hint()
@@ -222,8 +266,7 @@ CATEGORIES_CONFIG = "categories.yaml"
 
 
 def get_categories_config(inventree_api: InvenTreeAPI):
-    assert _config_dir is not None  # TODO
-    categories_config = _config_dir / CATEGORIES_CONFIG
+    categories_config = get_config_dir() / CATEGORIES_CONFIG
     if not categories_config.is_file():
         setup_default_configuration_files(inventree_api)
 
@@ -238,8 +281,7 @@ PARAMETERS_CONFIG = "parameters.yaml"
 
 
 def get_parameters_config(inventree_api: InvenTreeAPI):
-    assert _config_dir is not None  # TODO
-    parameters_config = _config_dir / PARAMETERS_CONFIG
+    parameters_config = get_config_dir() / PARAMETERS_CONFIG
     if not parameters_config.is_file():
         setup_default_configuration_files(inventree_api)
 
@@ -266,8 +308,8 @@ def setup_default_configuration_files(inventree_api: InvenTreeAPI):
 
         categories, parameters = setup_config_from_inventree(inventree_api)
 
-    assert _config_dir is not None  # TODO
-    categories_config = _config_dir / CATEGORIES_CONFIG
+    config_dir = get_config_dir()
+    categories_config = config_dir / CATEGORIES_CONFIG
     if not categories_config.is_file():
         match choice_index:
             case 0:
@@ -280,7 +322,7 @@ def setup_default_configuration_files(inventree_api: InvenTreeAPI):
             case _:
                 assert False
 
-    parameters_config = _config_dir / PARAMETERS_CONFIG
+    parameters_config = config_dir / PARAMETERS_CONFIG
     if not parameters_config.is_file():
         match choice_index:
             case 0:
@@ -296,8 +338,7 @@ def setup_default_configuration_files(inventree_api: InvenTreeAPI):
 
 @contextmanager
 def update_config_file(file_name: str) -> Generator[dict[str, Any]]:
-    assert _config_dir
-    config_path = _config_dir / file_name
+    config_path = get_config_dir() / file_name
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     try:
         yield config
@@ -315,8 +356,7 @@ SUPPLIERS_CONFIG = "suppliers.yaml"
 def load_suppliers_config(suppliers: dict[str, Supplier], setup: bool = True):
     suppliers_out: dict[str, Supplier] = {}
 
-    assert _config_dir is not None  # TODO
-    suppliers_config = _config_dir / SUPPLIERS_CONFIG
+    suppliers_config = get_config_dir() / SUPPLIERS_CONFIG
     if suppliers_config.is_file():
         try:
             with update_config_file(SUPPLIERS_CONFIG) as suppliers_config_data:
@@ -419,8 +459,7 @@ def get_pre_creation_hooks():
         return _pre_creation_hooks
     _pre_creation_hooks = []
 
-    assert _config_dir is not None  # TODO
-    hooks_config = _config_dir / HOOKS_CONFIG
+    hooks_config = get_config_dir() / HOOKS_CONFIG
     if not hooks_config.is_file():
         return _pre_creation_hooks
 
