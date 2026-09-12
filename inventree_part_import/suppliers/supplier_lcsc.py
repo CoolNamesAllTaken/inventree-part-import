@@ -29,41 +29,68 @@ class LCSC(Supplier):
         if not (result := self.lcsc_api.search(search_term)):
             return [], 0
 
+        # A product code (C25905) is answered with a redirect to the product's detail page.
         if product_detail := result.get("tipProductDetailUrlVO"):
             if detail_result := self.lcsc_api.product_detail(product_detail["productCode"]):
                 return [self.get_api_part(detail_result)], 1
+            return [], 0
 
-        elif products := result.get("productSearchResultVO"):
-            filtered_matches = [
-                product
-                for product in products["productList"]
-                if product["productModel"].lower().startswith(search_term.lower())
-                or product["productCode"].lower() == search_term.lower()
-            ]
+        term = search_term.lower()
 
-            exact_matches = [
-                product
-                for product in filtered_matches
-                if product["productModel"].lower() == search_term.lower()
-                or product["productCode"].lower() == search_term.lower()
-            ]
-            if self.ignore_duplicates:
-                exact_filtered = [
-                    product
-                    for product in exact_matches
-                    if product.get("stockNumber")
-                    or product.get("productImageUrlBig")
-                    or product.get("productImageUrl")
-                    or product.get("productImages")
-                ]
-                exact_matches = exact_filtered if exact_filtered else exact_matches
+        def is_exact(product: dict[str, Any]) -> bool:
+            return (
+                (product.get("productModel") or "").lower() == term
+                or (product.get("productCode") or "").lower() == term
+            )
 
-            if len(exact_matches) == 1:
-                return [self.get_api_part(exact_matches[0])], 1
+        def is_match(product: dict[str, Any]) -> bool:
+            return (
+                (product.get("productModel") or "").lower().startswith(term)
+                or (product.get("productCode") or "").lower() == term
+            )
 
-            return list(map(self.get_api_part, filtered_matches)), len(filtered_matches)
+        # The v3 global search lists only the products whose part number IS the search term
+        # (`exactMatchResult`); everything else it merely counts. The older response shape
+        # carried the whole page in `productSearchResultVO`, so keep reading that too.
+        products: list[dict[str, Any]] = []
+        if search_result := result.get("productSearchResultVO"):
+            products.extend(search_result.get("productList") or [])
+        products.extend(result.get("exactMatchResult") or [])
+        products = _unique_by_code(products)
 
-        return [], 0
+        exact_matches = self._prefer_stocked([p for p in products if is_exact(p)])
+        if len(exact_matches) == 1:
+            return [self.get_api_part(exact_matches[0])], 1
+
+        # Anything beyond the exact matches lives behind the product list endpoint, which
+        # takes the search term in the clear and pages.
+        total_count = result.get("totalCount")
+        if total_count is None or total_count > len(products):
+            products = _unique_by_code(products + self.lcsc_api.product_list(search_term))
+
+        filtered_matches = [product for product in products if is_match(product)]
+        exact_matches = self._prefer_stocked([p for p in filtered_matches if is_exact(p)])
+        if len(exact_matches) == 1:
+            return [self.get_api_part(exact_matches[0])], 1
+
+        return list(map(self.get_api_part, filtered_matches)), len(filtered_matches)
+
+    def _prefer_stocked(self, products: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """
+        LCSC lists some parts twice, and the duplicate is the one with no stock and no
+        picture. With `ignore_duplicates` those are dropped when a better listing exists.
+        """
+        if not self.ignore_duplicates:
+            return products
+        stocked = [
+            product
+            for product in products
+            if product.get("stockNumber")
+            or product.get("productImageUrlBig")
+            or product.get("productImageUrl")
+            or product.get("productImages")
+        ]
+        return stocked if stocked else products
 
     def get_api_part(self, lcsc_part: dict[str, Any]):
         if not (description := lcsc_part.get("productDescEn")):
@@ -76,9 +103,9 @@ class LCSC(Supplier):
                 if "front" in image_url:
                     break
 
-        datasheet_url = lcsc_part["pdfUrl"].replace(
-            "//datasheet.lcsc.com/", "//wmsc.lcsc.com/wmsc/upload/file/pdf/v2/"
-        )
+        # `pdfUrl` (on datasheet.lcsc.com) serves the PDF as given. It used to be rewritten
+        # onto wmsc.lcsc.com, which now answers with an HTML redirect to the product page.
+        datasheet_url = lcsc_part.get("pdfUrl") or None
 
         if url := lcsc_part.get("url"):
             url_separator = "/product-detail/"
@@ -113,12 +140,13 @@ class LCSC(Supplier):
         if package := lcsc_part.get("encapStandard"):
             parameters["Package Type"] = package
 
-        price_list = lcsc_part["productPriceList"]
+        price_list: Any = lcsc_part["productPriceList"] or []
         price_breaks = {
             price_break.get("ladder"): price_break.get("currencyPrice")
             for price_break in price_list
         }
-        currency = CURRENCY_MAP.get(price_list[0].get("currencySymbol")) or self.currency
+        currency_symbol: str | None = price_list[0].get("currencySymbol") if price_list else None
+        currency = (CURRENCY_MAP.get(currency_symbol) if currency_symbol else None) or self.currency
 
         api_part = ApiPart(
             description=REMOVE_HTML_TAGS.sub("", description),
@@ -126,10 +154,10 @@ class LCSC(Supplier):
             datasheet_url=datasheet_url,
             supplier_link=supplier_link,
             SKU=lcsc_part["productCode"],
-            manufacturer=REMOVE_HTML_TAGS.sub("", lcsc_part.get("brandNameEn", "")),
+            manufacturer=REMOVE_HTML_TAGS.sub("", lcsc_part.get("brandNameEn") or ""),
             manufacturer_link="",
-            MPN=lcsc_part.get("productModel", ""),
-            quantity_available=float(lcsc_part.get("stockNumber", 0)),
+            MPN=lcsc_part.get("productModel") or "",
+            quantity_available=float(lcsc_part.get("stockNumber") or 0),
             packaging=packaging,
             category_path=category_path,
             parameters=parameters,
@@ -143,18 +171,39 @@ class LCSC(Supplier):
         return api_part
 
     def finalize_hook(self, api_part: ApiPart):
+        # Search results carry no parameters for some parts; the detail page usually does.
+        # Some parts genuinely have none, and `paramVOList` is then null rather than empty.
+        detail: dict[str, Any] = self.lcsc_api.product_detail(api_part.SKU) or {}
+        parameters: Any = detail.get("paramVOList") or []
         api_part.parameters |= {
             parameter.get("paramNameEn"): parameter.get("paramValueEn")
-            for parameter in self.lcsc_api.product_detail(api_part.SKU)["paramVOList"]
+            for parameter in parameters
         }
+
+
+def _unique_by_code(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for product in products:
+        code = product.get("productCode") or ""
+        if code in seen:
+            continue
+        seen.add(code)
+        unique.append(product)
+    return unique
 
 
 class LCSCApi:
     MAIN_PAGE_URL = "https://www.lcsc.com/"
     API_BASE_URL = "https://wmsc.lcsc.com/ftps/wm/"
     SEARCH_URL = f"{API_BASE_URL}search/v3/global"
+    PRODUCT_LIST_URL = f"{API_BASE_URL}product/query/list"
     PRODUCT_INFO_URL = f"{API_BASE_URL}product/detail?productCode={{}}"
     CURRENCY_URL = "https://wmsc.lcsc.com/wmsc/home/currency?currencyCode={}"
+
+    #: One page of the product list is all a part number search needs: the site itself
+    #: shows 25 and pages from there.
+    PRODUCT_LIST_PAGE_SIZE = 50
 
     def __init__(self, currency: str):
         self.session = retries.setup_session()
@@ -171,15 +220,28 @@ class LCSCApi:
         self.sm2 = CryptSM2(None, public_key_match.group(1), mode=1)
 
     def search(self, keyword: str):
+        """
+        The global search: which product a code redirects to, the exact part number matches,
+        and a count of everything else.
+        """
         assert (keyword_encrypted := self.sm2.encrypt(base64.b64encode(keyword.encode("utf-8"))))
         return self._api_call(
             self.SEARCH_URL, json={"keyword": f"{{secret}}04{keyword_encrypted.hex()}"}
         )
 
+    def product_list(self, keyword: str, page: int = 1) -> list[dict[str, Any]]:
+        """The product records behind a search, as the site's results table lists them."""
+        result: dict[str, Any] = self._api_call(
+            self.PRODUCT_LIST_URL,
+            json={"keyword": keyword, "currentPage": page, "pageSize": self.PRODUCT_LIST_PAGE_SIZE},
+        ) or {}
+        products: list[dict[str, Any]] = result.get("dataList") or []
+        return products
+
     def product_detail(self, product_code: str):
         return self._api_call(self.PRODUCT_INFO_URL.format(quote(product_code, safe="")))
 
-    def _api_call(self, url: str, json: dict[str, Any] | None = None):
+    def _api_call(self, url: str, json: dict[str, Any] | None = None) -> Any:
         result = self.session.get(url) if json is None else self.session.post(url, json=json)
 
         if not result.content:
@@ -192,11 +254,12 @@ class LCSCApi:
         except JSONDecodeError as e:
             raise SupplierError("LCSC", str(e))
 
-        if result.status_code != 200:
-            if message := content_json.get("msg"):
-                raise SupplierError("LCSC", message)
-            else:
-                raise SupplierError("LCSC", "Unknown error")
+        # Failures come back as HTTP 200 with their own code in the body ("Invalid field",
+        # code 405, say), so the body's code is the one that counts.
+        code = content_json.get("code")
+        if result.status_code != 200 or (code is not None and code != 200):
+            message = content_json.get("msg") or f"Request failed with code {code or result.status_code}"
+            raise SupplierError("LCSC", message)
 
         return content_json["result"]
 
