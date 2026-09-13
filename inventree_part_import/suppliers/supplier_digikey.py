@@ -75,7 +75,9 @@ class DigiKey(Supplier):
             for product in result["Products"]
             if product["ManufacturerProductNumber"].lower().startswith(search_term.lower())
         ]
-        return list(map(self.get_api_part, products)), result["ProductsCount"]
+        # A keyword search that matches nothing comes back without `ProductsCount` (and without
+        # the filter options), so reading it unconditionally made "no such part" a KeyError.
+        return list(map(self.get_api_part, products)), result.get("ProductsCount", len(products))
 
     def get_api_part(self, product_details: dict[str, Any], digikey_part_number: str | None = None):
         if digikey_part_number:

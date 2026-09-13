@@ -130,6 +130,38 @@ def test_a_digikey_not_found_is_still_no_result():
     assert api.product_details("nothing") == {"title": "Not Found"}
 
 
+class FakeSearchApi:
+    """The two calls `DigiKey.search()` makes, answered from a canned keyword result."""
+
+    def __init__(self, keyword_result: dict[str, Any]):
+        self.keyword_result = keyword_result
+
+    def product_details(self, product_number: str) -> None:
+        return None
+
+    def keyword_search(self, search_term: str, limit: int = 0) -> dict[str, Any]:
+        return self.keyword_result
+
+
+def test_a_digikey_search_that_matches_nothing_is_no_result():
+    """
+    A keyword search that matches nothing comes back without `ProductsCount` (and without the
+    filter options). Reading the count unconditionally turned every part DigiKey does not
+    carry into a KeyError, reported as a failed search.
+    """
+    supplier = DigiKey()
+    supplier.limit = 10
+    supplier.digikey_api = FakeSearchApi(  # pyright: ignore[reportAttributeAccessIssue]
+        {
+            "ExactMatches": [],
+            "Products": [],
+            "SearchLocaleUsed": {"Currency": "USD", "Language": "en", "Site": "US"},
+        }
+    )
+
+    assert supplier.search("NOT-A-DIGIKEY-PART") == ([], 0)
+
+
 def test_search_results_are_cached_with_a_bound():
     class Counting(Supplier):
         SUPPORT_LEVEL = SupplierSupportLevel.OFFICIAL_API
