@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -102,6 +103,11 @@ class FakeResponse:
 class FakeSession:
     def __init__(self, response: FakeResponse):
         self.response = response
+        self.token: dict[str, Any] = {}
+        self.access_token = None
+
+    def fetch_token(self, url: str, **kwargs: Any):
+        pass
 
     def get(self, url: str, **kwargs: Any):
         return self.response
@@ -113,6 +119,8 @@ class FakeSession:
 def _api_with(response: FakeResponse) -> DigiKeyApi:
     api = DigiKeyApi.__new__(DigiKeyApi)
     api.session = FakeSession(response)  # pyright: ignore[reportAttributeAccessIssue]
+    api._client_secret = "secret"  # pyright: ignore[reportPrivateUsage]
+    api._token_lock = threading.Lock()  # pyright: ignore[reportPrivateUsage]
     return api
 
 

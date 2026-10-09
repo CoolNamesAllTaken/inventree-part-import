@@ -1,9 +1,11 @@
-from typing import Any
+import threading
+import time
+from typing import Any, cast
 
-from oauthlib.oauth2 import BackendApplicationClient
+from oauthlib.oauth2 import BackendApplicationClient, OAuth2Error, TokenExpiredError
 from requests import Response
 from requests.compat import quote
-from requests.exceptions import HTTPError, JSONDecodeError, Timeout
+from requests.exceptions import HTTPError, JSONDecodeError, RequestException, Timeout
 from requests_oauthlib import OAuth2Session
 
 from ..exceptions import SupplierError
@@ -134,12 +136,19 @@ class DigiKeyApi:
     KEYWORD_SEARCH_URL = f"{BASE_URL}/products/v4/search/keyword"
     PRODUCT_DETAILS_URL = f"{BASE_URL}/products/v4/search/{{}}/productdetails"
 
+    #: Re-fetch the token with this much of its life left, so a call never goes out with one
+    #: that expires in flight.
+    TOKEN_MARGIN_SECONDS = 60
+
     def __init__(
         self, client_id: str, client_secret: str, currency: str, language: str, location: str
     ):
+        self._client_secret = client_secret
+        self._token_lock = threading.Lock()
+
         oauth_client = BackendApplicationClient(client_id)
         self.session = setup_session(OAuth2Session(client=oauth_client))
-        self.session.fetch_token(self.OAUTH2_TOKEN_URL, client_secret=client_secret)  # pyright: ignore[reportUnknownMemberType]
+        self._fetch_token()
 
         headers = {
             "X-DIGIKEY-Client-Id": client_id,
@@ -170,7 +179,7 @@ class DigiKeyApi:
         result: Response | None = None
 
         try:
-            result = self.session.get(url) if json is None else self.session.post(url, json=json)
+            result = self._authorized_request(url, json)
             if result.status_code == 404 and result.json()["title"] == "Not Found":
                 return result
             result.raise_for_status()
@@ -178,8 +187,65 @@ class DigiKeyApi:
             raise SupplierError("DigiKey", _describe_failure(result, e)) from e
         except (JSONDecodeError, KeyError) as e:
             raise SupplierError("DigiKey", f"unexpected API response ({e})") from e
+        except OAuth2Error as e:
+            raise SupplierError("DigiKey", f"OAuth token rejected ({e})") from e
 
         return result
+
+    def _authorized_request(self, url: str, json: dict[str, Any] | None) -> Response:
+        """
+        The request, with a token that has not expired.
+
+        The token is a client-credentials one: DigiKey issues it for 599 seconds and with no
+        refresh token, so `OAuth2Session` cannot renew it by itself. Without this a supplier
+        kept for longer than that (one per server process, say) answered every call with
+        oauthlib's `TokenExpiredError`, or DigiKey's 401, until the process restarted.
+
+        So the token is fetched again shortly before it expires, and once more if it turns out
+        to be expired anyway (a skewed clock, a token DigiKey revoked early), and the request
+        is sent again once.
+        """
+        token = self._renew_token_if_expiring()
+        try:
+            result = self._request(url, json)
+            if result.status_code != 401:
+                return result
+        except TokenExpiredError:
+            pass
+
+        self._renew_token(unless_changed_from=token)
+        return self._request(url, json)
+
+    def _request(self, url: str, json: dict[str, Any] | None) -> Response:
+        return self.session.get(url) if json is None else self.session.post(url, json=json)
+
+    def _fetch_token(self):
+        self.session.fetch_token(self.OAUTH2_TOKEN_URL, client_secret=self._client_secret)  # pyright: ignore[reportUnknownMemberType]
+
+    @property
+    def _access_token(self) -> str | None:
+        return cast(str | None, self.session.access_token)
+
+    def _renew_token_if_expiring(self) -> str | None:
+        """The current access token, fetched again first if it is about to expire."""
+        token = cast(dict[str, Any], self.session.token)
+        expires_at: float | None = token.get("expires_at")
+        if expires_at is not None and time.time() >= expires_at - self.TOKEN_MARGIN_SECONDS:
+            self._renew_token(unless_changed_from=self._access_token)
+        return self._access_token
+
+    def _renew_token(self, unless_changed_from: str | None):
+        """
+        Fetch a new token, unless another thread already did since `unless_changed_from` was
+        current. A fetch that fails is a `SupplierError`, like any other failed call.
+        """
+        with self._token_lock:
+            if self._access_token != unless_changed_from:
+                return
+            try:
+                self._fetch_token()
+            except (OAuth2Error, RequestException, ValueError) as e:
+                raise SupplierError("DigiKey", f"failed to renew the OAuth token ({e})") from e
 
 
 def _describe_failure(result: Response | None, exception: Exception) -> str:
