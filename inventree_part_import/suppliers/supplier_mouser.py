@@ -12,6 +12,7 @@ from .base import (
     DOMAIN_SUB,
     REMOVE_HTML_TAGS,
     ApiPart,
+    lead_days,
     ScrapeSupplier,
     SupplierSupportLevel,
     money2float,
@@ -120,6 +121,7 @@ class Mouser(ScrapeSupplier):
             parameters=parameters,
             price_breaks=price_breaks,
             currency=currency,
+            lead_days=lead_days(mouser_part.get("LeadTime")),
         )
 
         api_part.finalize_hook = MethodType(self.finalize_hook, api_part)
