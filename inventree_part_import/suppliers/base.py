@@ -33,6 +33,8 @@ class ApiPart:
     parameters: dict[str, str]
     price_breaks: dict[int | float, float]
     currency: str
+    # The manufacturer's lead time in days, when the supplier states one.
+    lead_days: int | None = None
 
     def __post_init__(self):
         self._fix_urls()
@@ -228,3 +230,16 @@ def money2float(money: str):
 MONEY2FLOAT_CLEANUP = re.compile(r"[^(\d,.\-)]")
 MONEY2FLOAT_SPLIT = re.compile(r"(.*)(?:\.|,)(\d+)")
 MONEY2FLOAT_CLEANUP2 = re.compile(r"[^\d\-]")
+
+
+_LEAD = re.compile(r"(\d+(?:\.\d+)?)\s*(day|week)?", re.IGNORECASE)
+
+
+def lead_days(value: Any, *, unit: str = "day") -> int | None:
+    """Days from "112 Days", "16 Weeks" or a bare number in `unit`; None when nothing is stated."""
+    found = _LEAD.search(str(value)) if value not in (None, "") else None
+    if not found:
+        return None
+    number = float(found.group(1))
+    weeks = (found.group(2) or unit).lower() == "week"
+    return round(number * 7) if weeks else round(number)

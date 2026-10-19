@@ -11,7 +11,7 @@ from requests_oauthlib import OAuth2Session
 from ..exceptions import SupplierError
 from ..localization import get_country, get_language
 from ..retries import setup_session
-from .base import ApiPart, Supplier, SupplierSupportLevel
+from .base import ApiPart, Supplier, SupplierSupportLevel, lead_days
 
 
 class DigiKey(Supplier):
@@ -123,6 +123,7 @@ class DigiKey(Supplier):
             parameters=parameters,
             price_breaks=price_breaks,
             currency=self.currency,
+            lead_days=lead_days(product_details.get("ManufacturerLeadWeeks"), unit="week"),
         )
 
     @classmethod

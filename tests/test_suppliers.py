@@ -12,7 +12,7 @@ from inventree_part_import.suppliers import (
     discover_supplier_classes,
 )
 from inventree_part_import.suppliers import supplier_digikey
-from inventree_part_import.suppliers.base import ApiPart, Supplier, SupplierSupportLevel
+from inventree_part_import.suppliers.base import ApiPart, Supplier, SupplierSupportLevel, lead_days
 from inventree_part_import.suppliers.supplier_digikey import DigiKey, DigiKeyApi
 
 
@@ -189,3 +189,35 @@ def test_search_results_are_cached_with_a_bound():
     supplier.cached_search("c")          # evicts "a"
     supplier.cached_search("a")
     assert supplier.calls == 4
+
+
+@pytest.mark.parametrize(
+    "value, unit, days",
+    [("112 Days", "day", 112), ("16 Weeks", "day", 112), ("16", "week", 112), ("16 weeks", "week", 112),
+     ("0 Days", "day", 0), ("", "day", None), (None, "week", None), ("Contact factory", "day", None)],
+)
+def test_lead_times_are_read_as_days(value: Any, unit: str, days: int | None):
+    assert lead_days(value, unit=unit) == days
+
+
+def test_mouser_and_digikey_parts_carry_the_lead_time():
+    from inventree_part_import.suppliers.supplier_mouser import Mouser
+
+    mouser = Mouser.__new__(Mouser)
+    mouser.locale_url, mouser.currency = "www.mouser.com", "USD"
+    part = mouser.get_api_part({"MouserPartNumber": "604-APT1608SGC", "ManufacturerPartNumber": "APT1608SGC",
+                                "LeadTime": "56 Days", "PriceBreaks": []})
+    assert part.lead_days == 56
+
+    digikey = DigiKey()
+    digikey.currency = "USD"
+    variation = {"DigiKeyProductNumber": "754-1121-1-ND", "MinimumOrderQuantity": 1, "StandardPricing": [],
+                 "QuantityAvailableforPackageType": 10, "PackageType": {"Name": "Cut Tape"}}
+    details = {"Category": {"Name": "LEDs", "ChildCategories": []}, "Parameters": [],
+               "ProductVariations": [variation], "Description": {"DetailedDescription": "LED"},
+               "PhotoUrl": "", "DatasheetUrl": "", "ProductUrl": "https://www.digikey.com/p",
+               "Manufacturer": {"Name": "Kingbright"}, "ManufacturerProductNumber": "APT1608SGC",
+               "ManufacturerLeadWeeks": "8"}
+    assert digikey.get_api_part(details).lead_days == 56
+    del details["ManufacturerLeadWeeks"]
+    assert digikey.get_api_part(details).lead_days is None
